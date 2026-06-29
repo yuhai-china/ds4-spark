@@ -3577,7 +3577,7 @@ static void weights_validate_layout(
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
         tensor_expect_layout(w->output_norm,     DS4_TENSOR_F32,  1, DS4_N_EMBD, 0, 0);
-        tensor_expect_layout(w->output,          DS4_TENSOR_Q8_0, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+        tensor_expect_plain_layout(w->output,          2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     for (uint32_t il = layer_start; il <= layer_end; il++) {
@@ -10427,6 +10427,7 @@ typedef struct {
     ds4_gpu_tensor *markov_save_hc; /* layer 42 HC snapshot for Markov draft */
     ds4_gpu_tensor *markov_logits_gpu; /* GPU logits buffer for Markov head */
     float *markov_hc_cpu;          /* CPU-side copy of saved HC [hc_dim] */
+    float *markov_logits_cpu;      /* CPU-side copy of Markov logits [vocab] */
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
@@ -11182,6 +11183,7 @@ static bool metal_graph_alloc_raw_cap(
     g->markov_save_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->markov_logits_gpu = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
     g->markov_hc_cpu = xmalloc(hc_dim * sizeof(float));
+    g->markov_logits_cpu = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -17003,11 +17005,18 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
-        /* Save layer 42 HC for Markov draft before layer 43 overwrites it */
+        /* Save layer 42 HC and compute approximate output head for Markov draft */
         if (il == 41 && g->markov_save_hc != NULL) {
             uint64_t hc_bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
             ok = ds4_gpu_tensor_copy(g->markov_save_hc, 0,
                                       g->cur_hc, 0, hc_bytes) != 0;
+            /* Run output head on layer-42 HC: swap logits target, encode, restore */
+            if (ok && g->markov_logits_gpu != NULL) {
+                ds4_gpu_tensor *saved_logits = g->logits;
+                g->logits = g->markov_logits_gpu;
+                ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
+                g->logits = saved_logits;
+            }
         }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
@@ -19498,11 +19507,16 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
-    /* Read back layer 42 HC for Markov context drafting */
+    /* Read back layer 42 HC + GPU-computed Markov logits */
     if (ok && g->markov_save_hc && g->markov_hc_cpu) {
         ok = ds4_gpu_tensor_read(g->markov_save_hc, 0,
                                   g->markov_hc_cpu,
                                   (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float)) != 0;
+    }
+    if (ok && g->markov_logits_gpu && g->markov_logits_cpu) {
+        ok = ds4_gpu_tensor_read(g->markov_logits_gpu, 0,
+                                  g->markov_logits_cpu,
+                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
 
     if (ok && logits) {
@@ -27424,10 +27438,20 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     token_vec_push(&s->checkpoint, token);
     if (markov_should_draft) {
-        /* Use HC+output-head for single-token draft (much more accurate than Markov) */
-        int draft = markov_hc_draft(e);
-        if (draft >= 0) {
-            s->mtp_draft_token = draft;
+        /* GPU already computed output head on layer-42 HC.
+         * Just argmax the already-read markov_logits_cpu. */
+        int best_id = -1;
+        if (s->graph.markov_logits_cpu) {
+            float best = -1e38f;
+            for (uint32_t k = 0; k < DS4_N_VOCAB; k++) {
+                if (s->graph.markov_logits_cpu[k] > best) {
+                    best = s->graph.markov_logits_cpu[k];
+                    best_id = (int)k;
+                }
+            }
+        }
+        if (best_id >= 0) {
+            s->mtp_draft_token = best_id;
             s->mtp_draft_valid = true;
         }
     } else if (mtp_should_draft) {
