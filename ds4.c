@@ -24076,11 +24076,11 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 bool ds4_engine_has_mtp(ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           e->mtp_ready;
+           (e->mtp_ready || e->markov_ready);
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+    return (ds4_engine_has_mtp(e) || e->markov_ready) ? e->mtp_draft_tokens : 0;
 }
 
 /* Markov chain draft: given starting token, predict a chain of up to `max_draft`
@@ -27396,7 +27396,8 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     accepted[n_accept++] = first_token;
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
-    if (!e->mtp_ready || !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
+    if ((!e->mtp_ready && !e->markov_ready) ||
+        !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
     if (draft_cap > max_tokens - n_accept) draft_cap = max_tokens - n_accept;
@@ -27406,8 +27407,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (draft_cap <= 0) return n_accept;
 
     int drafts[16];
-    int draft_n = 1;
-    drafts[0] = s->mtp_draft_token;
+    int draft_n;
+    if (e->markov_ready) {
+        /* Fill all drafts at once from Markov chain */
+        draft_n = markov_draft_chain(e, s->mtp_draft_token, draft_cap, drafts);
+        if (draft_n <= 0) return n_accept;
+    } else {
+        draft_n = 1;
+        drafts[0] = s->mtp_draft_token;
+    }
     s->mtp_draft_valid = false;
     const bool strict_mtp = e->quality || getenv("DS4_MTP_STRICT") != NULL;
     float mtp_margin_threshold = e->mtp_margin;
@@ -27453,7 +27461,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         s->graph.mtp_n_raw = keep_; \
     } while (0)
 
-    for (; draft_n < draft_cap; draft_n++) {
+    for (; draft_n < draft_cap && !e->markov_ready; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
         int mtp_top = -1;
