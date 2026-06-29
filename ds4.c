@@ -24076,11 +24076,71 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 bool ds4_engine_has_mtp(ds4_engine *e) {
     return e && e->backend != DS4_BACKEND_CPU &&
            e->distributed.role == DS4_DISTRIBUTED_NONE &&
-           (e->mtp_ready || e->markov_ready);
+           e->mtp_ready;
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    return (ds4_engine_has_mtp(e) || e->markov_ready) ? e->mtp_draft_tokens : 0;
+    return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+}
+
+/* Whether HC-based speculative drafting is available (does NOT need Markov GGUF) */
+static bool ds4_engine_has_hc_draft(ds4_engine *e) {
+    return e && e->markov_hc != NULL;
+}
+
+/* HC prediction draft count */
+int ds4_engine_hc_draft_tokens(ds4_engine *e) {
+    return ds4_engine_has_hc_draft(e) ? e->mtp_draft_tokens : 0;
+}
+
+/* Fast draft using layer 42 HC direct + output head (much more accurate than Markov).
+ * Returns -1 on error. Complexity: O(vocab * n_embd) ≈ 528M MACs, ~5ms on CPU. */
+static int markov_hc_draft(ds4_engine *e) {
+    if (!e->markov_hc) return -1;
+    if (!e->weights.output || !e->weights.output_norm) return -1;
+
+    const float *hc = e->markov_hc;
+    uint32_t vocab = DS4_N_VOCAB;
+    uint32_t n_embd = DS4_N_EMBD;
+
+    float hidden[DS4_N_EMBD];
+    memcpy(hidden, hc, n_embd * sizeof(float));
+
+    const float *norm_w = (const float *)tensor_data(&e->model, e->weights.output_norm);
+    float eps = (float)g_ds4_shape.rms_eps;
+    float sum_sq = 0.0f;
+    for (uint32_t i = 0; i < n_embd; i++) sum_sq += hidden[i] * hidden[i];
+    float rms = 1.0f / sqrtf(sum_sq / (float)n_embd + eps);
+    for (uint32_t i = 0; i < n_embd; i++) hidden[i] *= rms * norm_w[i];
+
+    const float *out_w = (const float *)tensor_data(&e->model, e->weights.output);
+    /* output is [vocab, n_embd] in GGUF memory (row-major).
+     * BLAS: logits = output_weight @ hidden [vocab] = [vocab, n_embd] @ [n_embd] */
+#ifdef __APPLE__
+    float *logits_buf = xmalloc((size_t)vocab * sizeof(float));
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                (int)vocab, (int)n_embd, 1.0f,
+                out_w, (int)n_embd,
+                hidden, 1, 0.0f,
+                logits_buf, 1);
+    float best = -1e38f;
+    int best_id = -1;
+    for (uint32_t k = 0; k < vocab; k++) {
+        if (logits_buf[k] > best) { best = logits_buf[k]; best_id = (int)k; }
+    }
+    free(logits_buf);
+    return best_id;
+#else
+    float best = -1e38f;
+    int best_id = -1;
+    for (uint32_t k = 0; k < vocab; k++) {
+        float s = 0.0f;
+        const float *row = out_w + (size_t)k * n_embd;
+        for (uint32_t i = 0; i < n_embd; i++) s += hidden[i] * row[i];
+        if (s > best) { best = s; best_id = (int)k; }
+    }
+    return best_id;
+#endif
 }
 
 /* Markov chain draft: given starting token, predict a chain of up to `max_draft`
@@ -25883,6 +25943,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
       }
 
+    /* Allocate HC buffer for speculative drafting (unconditional — 64 KiB) */
+    if (!e->markov_hc) {
+        e->markov_hc = xmalloc((size_t)DS4_N_EMBD * DS4_N_HC * sizeof(float));
+        fprintf(stderr, "ds4: HC draft buffer allocated (%p)\n", (void*)e->markov_hc);
+    }
+
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
 #ifdef __APPLE__
@@ -27294,7 +27360,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
-    const bool markov_should_draft = probe_mtp && e->markov_ready;
+    const bool markov_should_draft = false; /* drafting done in spec argmax */
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
@@ -27327,12 +27393,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     token_vec_push(&s->checkpoint, token);
     if (markov_should_draft) {
-        int drafts[16];
-        int ndraft = markov_draft_chain(e, token, e->mtp_draft_tokens > 0 ? e->mtp_draft_tokens : 5, drafts);
-        if (ndraft > 0) {
-            s->mtp_draft_token = drafts[0];
+        /* Use HC+output-head for single-token draft (much more accurate than Markov) */
+        int draft = markov_hc_draft(e);
+        if (draft >= 0) {
+            s->mtp_draft_token = draft;
             s->mtp_draft_valid = true;
-            /* TODO: store chain for multi-token verification */
         }
     } else if (mtp_should_draft) {
         int mtp_top = -1;
@@ -27405,9 +27470,20 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
     int n_accept = 0;
     accepted[n_accept++] = first_token;
+
+    /* Compute HC draft if available */
+    bool use_hc_draft = ds4_engine_has_hc_draft(e);
+    if (use_hc_draft) {
+        int d = markov_hc_draft(e);
+        if (d >= 0) {
+            s->mtp_draft_token = d;
+            s->mtp_draft_valid = true;
+        }
+    }
+
     if (first_token == eos_token || max_tokens == 1 || n_accept >= accepted_cap) return n_accept;
 
-    if ((!e->mtp_ready && !e->markov_ready) ||
+    if ((!e->mtp_ready && !use_hc_draft) ||
         !s->mtp_draft_valid || e->mtp_draft_tokens <= 1) return n_accept;
 
     int draft_cap = e->mtp_draft_tokens;
@@ -27419,10 +27495,10 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
     int drafts[16];
     int draft_n;
-    if (e->markov_ready) {
-        /* Fill all drafts at once from Markov chain */
-        draft_n = markov_draft_chain(e, s->mtp_draft_token, draft_cap, drafts);
-        if (draft_n <= 0) return n_accept;
+    if (use_hc_draft) {
+        /* Use HC+output-head draft (single token) */
+        draft_n = 1;
+        drafts[0] = s->mtp_draft_token;
     } else {
         draft_n = 1;
         drafts[0] = s->mtp_draft_token;
@@ -27472,7 +27548,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         s->graph.mtp_n_raw = keep_; \
     } while (0)
 
-    for (; draft_n < draft_cap && !e->markov_ready; draft_n++) {
+    for (; draft_n < draft_cap && !use_hc_draft; draft_n++) {
         ds4_gpu_tensor *prev_hc = (draft_n & 1) ? s->graph.mtp_state_hc : s->graph.mtp_next_hc;
         ds4_gpu_tensor *out_hc = (draft_n & 1) ? s->graph.mtp_next_hc : s->graph.mtp_state_hc;
         int mtp_top = -1;
