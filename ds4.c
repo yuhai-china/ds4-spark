@@ -24083,9 +24083,17 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
-/* Whether HC-based speculative drafting is available (does NOT need Markov GGUF) */
+/* Whether HC-based speculative drafting is available */
 static bool ds4_engine_has_hc_draft(ds4_engine *e) {
-    return e && e->markov_hc != NULL;
+    if (!e || !e->markov_hc) return false;
+    /* HC draft needs F32/F16 output head for fast BLAS.
+     * Q8_0/Q4_K output weights would need dequant, too slow on CPU. */
+    if (!e->weights.output || !e->weights.output_norm) return false;
+    if (e->weights.output->type != DS4_TENSOR_F32 &&
+        e->weights.output->type != DS4_TENSOR_F16 &&
+        e->weights.output->type != DS4_TENSOR_Q8_0) return false;
+    if (e->weights.output_norm->type != DS4_TENSOR_F32) return false;
+    return true;
 }
 
 /* HC prediction draft count */
@@ -24113,10 +24121,34 @@ static int markov_hc_draft(ds4_engine *e) {
     float rms = 1.0f / sqrtf(sum_sq / (float)n_embd + eps);
     for (uint32_t i = 0; i < n_embd; i++) hidden[i] *= rms * norm_w[i];
 
-    const float *out_w = (const float *)tensor_data(&e->model, e->weights.output);
-    /* output is [vocab, n_embd] in GGUF memory (row-major).
-     * BLAS: logits = output_weight @ hidden [vocab] = [vocab, n_embd] @ [n_embd] */
+    if (e->weights.output->type == DS4_TENSOR_Q8_0) {
+        /* Q8_0 quantized output: dequant row-by-row */
+        const uint8_t *q8_data = (const uint8_t *)tensor_data(&e->model, e->weights.output);
+        uint32_t blocks = n_embd / 32;  /* 128 */
+        uint32_t stride = blocks * 34;   /* bytes per row */
+
+        float best = -1e38f;
+        int best_id = -1;
+        for (uint32_t k = 0; k < vocab; k++) {
+            const uint8_t *row = q8_data + (size_t)k * stride;
+            float s = 0.0f;
+            for (uint32_t b = 0; b < blocks; b++) {
+                const int8_t *q = (const int8_t *)(row + b * 34);
+                uint16_t d16; memcpy(&d16, row + b * 34 + 32, 2);
+                float d = f16_to_f32(d16);
+                float bs = 0.0f;
+                for (uint32_t j = 0; j < 32; j++)
+                    bs += hidden[b * 32 + j] * (float)(int)q[j];
+                s += bs * d;
+            }
+            if (s > best) { best = s; best_id = (int)k; }
+        }
+        return best_id;
+    }
+
+    /* F32/F16 output: use BLAS */
 #ifdef __APPLE__
+    const float *out_w = (const float *)tensor_data(&e->model, e->weights.output);
     float *logits_buf = xmalloc((size_t)vocab * sizeof(float));
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
                 (int)vocab, (int)n_embd, 1.0f,
@@ -24131,6 +24163,7 @@ static int markov_hc_draft(ds4_engine *e) {
     free(logits_buf);
     return best_id;
 #else
+    const float *out_w = (const float *)tensor_data(&e->model, e->weights.output);
     float best = -1e38f;
     int best_id = -1;
     for (uint32_t k = 0; k < vocab; k++) {
