@@ -10426,6 +10426,7 @@ typedef struct {
     ds4_gpu_tensor *mtp_next_hc;
     ds4_gpu_tensor *markov_save_hc; /* layer 42 HC snapshot for Markov draft */
     ds4_gpu_tensor *markov_logits_gpu; /* GPU logits buffer for Markov head */
+    float *markov_hc_cpu;          /* CPU-side copy of saved HC [hc_dim] */
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
@@ -11179,8 +11180,8 @@ static bool metal_graph_alloc_raw_cap(
 
     /* Markov HC save buffer (small — allocated unconditionally to keep code simple) */
     g->markov_save_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
-    g->markov_save_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
     g->markov_logits_gpu = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
+    g->markov_hc_cpu = xmalloc(hc_dim * sizeof(float));
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -17002,6 +17003,12 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_tensor *tmp = g->cur_hc;
         g->cur_hc = g->after_ffn_hc;
         g->after_ffn_hc = tmp;
+        /* Save layer 42 HC for Markov draft before layer 43 overwrites it */
+        if (il == 41 && g->markov_save_hc != NULL) {
+            uint64_t hc_bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+            ok = ds4_gpu_tensor_copy(g->markov_save_hc, 0,
+                                      g->cur_hc, 0, hc_bytes) != 0;
+        }
         if (ok && allow_split_flush && split_after_layers != 0 && il + 1u == split_after_layers) {
             ok = ds4_gpu_flush_commands() != 0;
         }
@@ -19491,6 +19498,13 @@ static bool metal_graph_eval_token_raw_swa(
     if (ok) ok = ds4_gpu_end_commands() != 0;
     const double t_done = (profile || throttle) ? now_sec() : 0.0;
 
+    /* Read back layer 42 HC for Markov context drafting */
+    if (ok && g->markov_save_hc && g->markov_hc_cpu) {
+        ok = ds4_gpu_tensor_read(g->markov_save_hc, 0,
+                                  g->markov_hc_cpu,
+                                  (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float)) != 0;
+    }
+
     if (ok && logits) {
         ok = ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
     }
@@ -21828,6 +21842,7 @@ struct ds4_engine {
     ds4_tensor *markov_w1;       /* [rank, vocab] F16, token → markov embed */
     ds4_tensor *markov_w2;       /* [rank, vocab] F16, embed → logits */
     float *markov_w2_f32;        /* pre-dequantized w2 in F32 [rank, vocab] */
+    float *markov_hc;            /* layer 42 HC snapshot [hc_dim] for context drafting */
     int markov_rank;             /* Markov head bottleneck rank (256 for DSpark) */
     bool markov_ready;           /* Markov head loaded */
     int mtp_draft_tokens;
@@ -24084,8 +24099,6 @@ static int markov_draft_chain(ds4_engine *e, int start_token,
     const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w1);
     const float *w2_f32 = e->markov_w2_f32;
 
-    /* w1 and w2 are [rank, vocab] in GGUF memory layout.
-     * w1_f16[j*vocab + token] accesses row j, column token. */
     float *logits = xmalloc((size_t)vocab * sizeof(float));
 
     int count = 0;
@@ -24106,7 +24119,7 @@ static int markov_draft_chain(ds4_engine *e, int start_token,
         for (uint32_t k = 0; k < vocab; k++) {
             float s = 0.0f;
             for (int j = 0; j < rank; j++)
-                s += embed[j] * w2_f32[(size_t)j * vocab + k];
+                s += embed[j] * w2_f32[(size_t)j * vocab + (size_t)k];
             logits[k] = s;
         }
 #endif
@@ -25846,6 +25859,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                         e->markov_rank = (int)e->markov_w1->dim[1];
                         size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
                         e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
+                        e->markov_hc = xmalloc((size_t)DS4_N_EMBD * DS4_N_HC * sizeof(float));
                         const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w2);
                         for (size_t i = 0; i < w2_sz; i++)
                             e->markov_w2_f32[i] = f16_to_f32(w2_f16[i]);
@@ -27294,6 +27308,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         snprintf(err, errlen, "%s decode failed", ds4_backend_name(e->backend));
         s->checkpoint_valid = false;
         return 1;
+    }
+    /* Copy layer 42 HC from GPU to engine for Markov context drafting */
+    if (e->markov_hc && s->graph.markov_hc_cpu) {
+        uint64_t hc_bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+        memcpy(e->markov_hc, s->graph.markov_hc_cpu, (size_t)hc_bytes);
     }
     token_vec_push(&s->checkpoint, token);
     if (markov_should_draft) {
