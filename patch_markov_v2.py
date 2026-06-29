@@ -115,8 +115,7 @@ def main():
         extras.append((ename, eshape, f16buf, esz, padded_esz))
 
     # Write new GGUF
-    bak = gguf_path + ".bak.ok"
-    os.rename(gguf_path, bak)
+    print("(no backup - overwriting in place)")
 
     with open(gguf_path, "wb") as f:
         f.write(b'GGUF')
@@ -158,7 +157,6 @@ def main():
             f.write(ebuf)
             f.write(b'\0'*(padded_esz-esz))
 
-    print(f"Backup: {bak}")
     print(f"Written: {gguf_path} ({len(tensors)+len(extras)} tensors)")
 
 if __name__ == "__main__":

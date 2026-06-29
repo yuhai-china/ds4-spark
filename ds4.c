@@ -21813,6 +21813,7 @@ struct ds4_vocab {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model markov_model;    /* separate GGUF with Markov head weights */
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -24070,7 +24071,7 @@ static int markov_draft(ds4_engine *e, int token) {
 
     int rank = e->markov_rank;
     uint32_t vocab = DS4_N_VOCAB;
-    const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->model, e->markov_w1);
+    const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w1);
     const float *w2_f32 = e->markov_w2_f32;
 
     /* embed[j] = f16_to_f32(w1[j * vocab + token]) */
@@ -25758,24 +25759,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 e->mtp_draft_tokens);
     }
 
-    /* Load Markov head from base model GGUF (DSpark only) */
-    e->markov_w1 = model_find_tensor(&e->model, "markov_head.w1.weight");
-    e->markov_w2 = model_find_tensor(&e->model, "markov_head.w2.weight");
-    if (e->markov_w1 && e->markov_w2 &&
-        e->markov_w1->dim[0] == e->markov_w2->dim[0] &&
-        e->markov_w1->dim[1] == DS4_N_VOCAB &&
-        e->markov_w2->dim[1] == DS4_N_VOCAB) {
-        e->markov_rank = (int)e->markov_w1->dim[0];
-        /* Pre-dequantize w2 to F32 for fast lookup */
-        size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
-        e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
-        const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->model, e->markov_w2);
-        for (size_t i = 0; i < w2_sz; i++)
-            e->markov_w2_f32[i] = f16_to_f32(w2_f16[i]);
-        e->markov_ready = true;
-        fprintf(stderr, "ds4: Markov head loaded (rank=%d, vocab=%d)\n",
-                e->markov_rank, (int)DS4_N_VOCAB);
-    }
+    /* Load Markov head from separate GGUF file */
+     if (opt->markov_path && opt->markov_path[0] &&
+         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        model_open(&e->markov_model, opt->markov_path, graph_backend, true);
+        e->markov_w1 = model_find_tensor(&e->markov_model, "markov_head.w1.weight");
+        e->markov_w2 = model_find_tensor(&e->markov_model, "markov_head.w2.weight");
+        if (e->markov_w1 && e->markov_w2 &&
+            e->markov_w1->dim[0] == e->markov_w2->dim[0] &&
+            e->markov_w1->dim[1] == DS4_N_VOCAB &&
+            e->markov_w2->dim[1] == DS4_N_VOCAB) {
+            e->markov_rank = (int)e->markov_w1->dim[0];
+            size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
+            e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
+            const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w2);
+            for (size_t i = 0; i < w2_sz; i++)
+                e->markov_w2_f32[i] = f16_to_f32(w2_f16[i]);
+            e->markov_ready = true;
+            fprintf(stderr, "ds4: Markov head loaded from %s (rank=%d, vocab=%d)\n",
+                    opt->markov_path, e->markov_rank, (int)DS4_N_VOCAB);
+        }
+     }
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
@@ -27188,7 +27192,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
 #else
     ds4_engine *e = s->engine;
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
-    const bool markov_should_draft = false; /* DISABLED: needs GGUF patching fix */
+    const bool markov_should_draft = probe_mtp && e->markov_ready;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
         (e->mtp_draft_tokens > 1 || mtp_probe_log);

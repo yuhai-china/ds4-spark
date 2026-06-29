@@ -171,6 +171,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
+            opt(fp, c, "--markov FILE", "Optional Markov head GGUF for fast token drafting (DSpark).");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");

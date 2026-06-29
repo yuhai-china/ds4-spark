@@ -94,6 +94,7 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *markov_path;
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
