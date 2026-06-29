@@ -24077,18 +24077,17 @@ static int markov_draft_chain(ds4_engine *e, int start_token,
     const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w1);
     const float *w2_f32 = e->markov_w2_f32;
 
-    /* Reusable logits buffer on stack (if vocab fits) */
+    /* w1 and w2 are [rank, vocab] in GGUF memory layout.
+     * w1_f16[j*vocab + token] accesses row j, column token. */
     float *logits = xmalloc((size_t)vocab * sizeof(float));
 
     int count = 0;
     int cur_token = start_token;
     for (int step = 0; step < max_draft; step++) {
-        /* embed = w1[cur_token, :] */
         float embed[256];
         for (int j = 0; j < rank; j++)
             embed[j] = f16_to_f32(w1_f16[(size_t)j * vocab + (size_t)cur_token]);
 
-        /* logits = w2 @ embed via BLAS */
 #ifdef __APPLE__
         memset(logits, 0, (size_t)vocab * sizeof(float));
         cblas_sgemv(CblasRowMajor, CblasNoTrans,
@@ -24100,11 +24099,10 @@ static int markov_draft_chain(ds4_engine *e, int start_token,
         for (uint32_t k = 0; k < vocab; k++) {
             float s = 0.0f;
             for (int j = 0; j < rank; j++)
-                s += embed[j] * w2_f32[(size_t)j * vocab + (size_t)k];
+                s += embed[j] * w2_f32[(size_t)j * vocab + k];
             logits[k] = s;
         }
 #endif
-        /* argmax */
         float best = -1e38f;
         int best_id = -1;
         for (uint32_t k = 0; k < vocab; k++) {
@@ -25817,25 +25815,28 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                             memcpy(&t->dim[j], d + pos, 8); pos += 8;
                         }
                         memcpy(&t->type, d + pos, 4); pos += 4;
-                        uint64_t rel_off; memcpy(&rel_off, d + pos, 8); pos += 8;
-                        t->rel_offset = rel_off;
-                        /* Compute abs_offset and elements */
+                        memcpy(&t->rel_offset, d + pos, 8); pos += 8;
                         t->elements = 1;
                         for (uint32_t j = 0; j < nd; j++) t->elements *= t->dim[j];
                         t->bytes = t->elements * (t->type == 1 ? 2 : 4);
-                        /* Align descriptor end */
-                        size_t desc_aligned = ((pos + 31) / 32) * 32;
-                        t->abs_offset = (uint64_t)desc_aligned + rel_off;
+                    }
+                    /* Compute tensor_data_pos ONCE after the loop */
+                    uint64_t desc_aligned = ((uint64_t)pos + 31ULL) & ~31ULL;
+                    e->markov_model.tensor_data_pos = desc_aligned;
+                    for (uint64_t i = 0; i < ntensors; i++) {
+                        e->markov_model.tensors[i].abs_offset =
+                            desc_aligned + e->markov_model.tensors[i].rel_offset;
                     }
                     close(mfd);
 
                     e->markov_w1 = model_find_tensor(&e->markov_model, "markov_head.w1.weight");
                     e->markov_w2 = model_find_tensor(&e->markov_model, "markov_head.w2.weight");
+                    /* GGUF reverses dims: ne[0]=vocab, ne[1]=rank */
                     if (e->markov_w1 && e->markov_w2 &&
                         e->markov_w1->dim[0] == e->markov_w2->dim[0] &&
-                        e->markov_w1->dim[1] == DS4_N_VOCAB &&
-                        e->markov_w2->dim[1] == DS4_N_VOCAB) {
-                        e->markov_rank = (int)e->markov_w1->dim[0];
+                        e->markov_w1->dim[1] == e->markov_w2->dim[1] &&
+                        e->markov_w1->dim[0] == DS4_N_VOCAB) {
+                        e->markov_rank = (int)e->markov_w1->dim[1];
                         size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
                         e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
                         const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w2);

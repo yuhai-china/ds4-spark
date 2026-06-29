@@ -1460,6 +1460,7 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--markov")) {
             c.engine.markov_path = need_arg(&i, argc, argv, arg);
+            fprintf(stderr, "ds4: --markov %s\n", c.engine.markov_path);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
