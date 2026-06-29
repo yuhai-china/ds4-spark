@@ -10424,6 +10424,8 @@ typedef struct {
     ds4_gpu_tensor *mtp_input_hc;
     ds4_gpu_tensor *mtp_state_hc;
     ds4_gpu_tensor *mtp_next_hc;
+    ds4_gpu_tensor *markov_save_hc; /* layer 42 HC snapshot for Markov draft */
+    ds4_gpu_tensor *markov_logits_gpu; /* GPU logits buffer for Markov head */
     ds4_gpu_tensor *mtp_raw_cache;
     uint32_t mtp_n_raw;
     uint32_t prefill_cap;
@@ -11174,6 +11176,11 @@ static bool metal_graph_alloc_raw_cap(
         g->spec_logits = ds4_gpu_tensor_alloc((uint64_t)16 * DS4_N_VOCAB * sizeof(float));
         g->mtp_n_raw = 0;
     }
+
+    /* Markov HC save buffer (small — allocated unconditionally to keep code simple) */
+    g->markov_save_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    g->markov_save_hc = ds4_gpu_tensor_alloc(hc_dim * sizeof(float));
+    g->markov_logits_gpu = ds4_gpu_tensor_alloc((uint64_t)DS4_N_VOCAB * sizeof(float));
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
