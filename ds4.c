@@ -25944,10 +25944,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
       }
 
     /* Allocate HC buffer for speculative drafting (unconditional — 64 KiB) */
-    if (!e->markov_hc) {
+    if (!e->markov_hc)
         e->markov_hc = xmalloc((size_t)DS4_N_EMBD * DS4_N_HC * sizeof(float));
-        fprintf(stderr, "ds4: HC draft buffer allocated (%p)\n", (void*)e->markov_hc);
-    }
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
