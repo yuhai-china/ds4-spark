@@ -24098,15 +24098,26 @@ static int markov_draft_chain(ds4_engine *e, int start_token,
     uint32_t vocab = DS4_N_VOCAB;
     const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w1);
     const float *w2_f32 = e->markov_w2_f32;
+    const float *hc = e->markov_hc;     /* layer 42 HC [hc_dim] */
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC; /* 16384 */
+    bool has_hc = (hc != NULL);
 
     float *logits = xmalloc((size_t)vocab * sizeof(float));
+    float hc_pooled[256]; /* HC context for Markov embed */
+    if (has_hc) {
+        /* Use first 256 dims of HC directly as Markov context */
+        for (int j = 0; j < rank; j++)
+            hc_pooled[j] = hc[j];
+    }
 
     int count = 0;
     int cur_token = start_token;
     for (int step = 0; step < max_draft; step++) {
         float embed[256];
-        for (int j = 0; j < rank; j++)
+        for (int j = 0; j < rank; j++) {
             embed[j] = f16_to_f32(w1_f16[(size_t)j * vocab + (size_t)cur_token]);
+            if (has_hc) embed[j] += hc_pooled[j] * 0.1f; /* blend HC context */
+        }
 
 #ifdef __APPLE__
         memset(logits, 0, (size_t)vocab * sizeof(float));
