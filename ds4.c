@@ -24061,57 +24061,61 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
-/* Markov head draft: token t → w1[t] embed lookup → w2 linear → logits → argmax.
- * Returns next-token prediction or -1 if disabled/error.
- * Complexity: O(rank * vocab) ~ 33M MACs, ~1 ms on modern CPU. */
-static int markov_draft(ds4_engine *e, int token) {
-    if (!e->markov_ready || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return -1;
+/* Markov chain draft: given starting token, predict a chain of up to `max_draft`
+ * tokens using w1 lookup + w2 linear projection.  Writes drafts into `drafts_out`.
+ * Returns number of valid drafts (0 if markov not ready). */
+static int markov_draft_chain(ds4_engine *e, int start_token, 
+                               int max_draft, int *drafts_out) {
+    if (!e->markov_ready || start_token < 0 || (uint32_t)start_token >= DS4_N_VOCAB) 
+        return 0;
     if (e->markov_w1->type != DS4_TENSOR_F16 ||
-        e->markov_w2->type != DS4_TENSOR_F16) return -1;
+        e->markov_w2->type != DS4_TENSOR_F16) return 0;
+    if (max_draft > 16) max_draft = 16;
 
     int rank = e->markov_rank;
     uint32_t vocab = DS4_N_VOCAB;
     const uint16_t *w1_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w1);
     const float *w2_f32 = e->markov_w2_f32;
 
-    /* embed[j] = f16_to_f32(w1[j * vocab + token]) */
-    float embed[256];
-    for (int j = 0; j < rank; j++)
-        embed[j] = f16_to_f32(w1_f16[(size_t)j * vocab + (size_t)token]);
+    /* Reusable logits buffer on stack (if vocab fits) */
+    float *logits = xmalloc((size_t)vocab * sizeof(float));
 
-    /* logits = w2^T @ embed  [vocab=129280] = [vocab, rank] @ [rank]
-     * Using cblas_sgemv: y = alpha * A * x + beta * y
-     * A is w2_f32 with layout [vocab rows, rank cols], row-major
-     * But cblas_sgemv expects column-major. Since our matrix is row-major
-     * and we want w2 @ embed, we can transpose: embed^T @ w2^T
-     * w2_f32 is [vocab, rank] row-major = [rank, vocab] column-major
-     * cblas_sgemv(CblasRowMajor, CblasNoTrans, vocab, rank, 1, w2, rank, embed, 1, 0, logits, 1)
-     */
-#ifdef __APPLE__
-    float logits[DS4_N_VOCAB];
-    memset(logits, 0, sizeof(logits));
-    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                (int)vocab, rank, 1.0f,
-                w2_f32, rank,
-                embed, 1, 0.0f,
-                logits, 1);
-    float best = -1e38f;
-    int best_id = -1;
-    for (uint32_t k = 0; k < vocab; k++) {
-        if (logits[k] > best) { best = logits[k]; best_id = (int)k; }
-    }
-    return best_id;
-#else
-    float best = -1e38f;
-    int best_id = -1;
-    for (uint32_t k = 0; k < vocab; k++) {
-        float s = 0.0f;
+    int count = 0;
+    int cur_token = start_token;
+    for (int step = 0; step < max_draft; step++) {
+        /* embed = w1[cur_token, :] */
+        float embed[256];
         for (int j = 0; j < rank; j++)
-            s += embed[j] * w2_f32[(size_t)j * vocab + (size_t)k];
-        if (s > best) { best = s; best_id = (int)k; }
-    }
-    return best_id;
+            embed[j] = f16_to_f32(w1_f16[(size_t)j * vocab + (size_t)cur_token]);
+
+        /* logits = w2 @ embed via BLAS */
+#ifdef __APPLE__
+        memset(logits, 0, (size_t)vocab * sizeof(float));
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    (int)vocab, rank, 1.0f,
+                    w2_f32, rank,
+                    embed, 1, 0.0f,
+                    logits, 1);
+#else
+        for (uint32_t k = 0; k < vocab; k++) {
+            float s = 0.0f;
+            for (int j = 0; j < rank; j++)
+                s += embed[j] * w2_f32[(size_t)j * vocab + (size_t)k];
+            logits[k] = s;
+        }
 #endif
+        /* argmax */
+        float best = -1e38f;
+        int best_id = -1;
+        for (uint32_t k = 0; k < vocab; k++) {
+            if (logits[k] > best) { best = logits[k]; best_id = (int)k; }
+        }
+        if (best_id < 0 || best_id >= (int)vocab) break;
+        drafts_out[count++] = best_id;
+        cur_token = best_id;
+    }
+    free(logits);
+    return count;
 }
 
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
@@ -25760,26 +25764,91 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
     /* Load Markov head from separate GGUF file */
-     if (opt->markov_path && opt->markov_path[0] &&
-         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        model_open(&e->markov_model, opt->markov_path, graph_backend, true);
-        e->markov_w1 = model_find_tensor(&e->markov_model, "markov_head.w1.weight");
-        e->markov_w2 = model_find_tensor(&e->markov_model, "markov_head.w2.weight");
-        if (e->markov_w1 && e->markov_w2 &&
-            e->markov_w1->dim[0] == e->markov_w2->dim[0] &&
-            e->markov_w1->dim[1] == DS4_N_VOCAB &&
-            e->markov_w2->dim[1] == DS4_N_VOCAB) {
-            e->markov_rank = (int)e->markov_w1->dim[0];
-            size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
-            e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
-            const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w2);
-            for (size_t i = 0; i < w2_sz; i++)
-                e->markov_w2_f32[i] = f16_to_f32(w2_f16[i]);
-            e->markov_ready = true;
-            fprintf(stderr, "ds4: Markov head loaded from %s (rank=%d, vocab=%d)\n",
-                    opt->markov_path, e->markov_rank, (int)DS4_N_VOCAB);
+      if (opt->markov_path && opt->markov_path[0] &&
+          opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        /* Markov head is a tiny GGUF (126 MiB).  mmap it directly rather
+         * than going through model_open which requires full model metadata. */
+        int mfd = open(opt->markov_path, O_RDONLY);
+        if (mfd >= 0) {
+            struct stat st;
+            if (fstat(mfd, &st) == 0) {
+                void *map = mmap(NULL, (size_t)st.st_size, PROT_READ,
+                                 MAP_SHARED, mfd, 0);
+                if (map != MAP_FAILED) {
+                    e->markov_model.map = (const uint8_t *)map;
+                    e->markov_model.size = (uint64_t)st.st_size;
+                    e->markov_model.fd = mfd;
+
+                    /* Parse just the tensor directory from the GGUF header */
+                    const uint8_t *d = e->markov_model.map;
+                    uint64_t ntensors, nkv;
+                    memcpy(&ntensors, d + 8, 8);
+                    memcpy(&nkv, d + 16, 8);
+
+                    size_t pos = 24;
+                    for (uint64_t i = 0; i < nkv; i++) {
+                        uint64_t kl; memcpy(&kl, d + pos, 8); pos += 8 + kl;
+                        uint32_t t; memcpy(&t, d + pos, 4); pos += 4;
+                        if (t == 8) { uint64_t sl; memcpy(&sl, d + pos, 8); pos += 8+sl; }
+                        else if (t == 9) {
+                            uint32_t et; memcpy(&et, d + pos, 4); pos += 4;
+                            uint64_t n; memcpy(&n, d + pos, 8); pos += 8;
+                            if (et == 8) {
+                                for (uint64_t j=0;j<n;j++) { uint64_t sl; memcpy(&sl,d+pos,8); pos+=8+sl; }
+                            } else { uint8_t szs[] = {1,1,2,2,4,4,4,1,0,0,8,8,8}; pos += n*(size_t)szs[et<13?et:4]; }
+                        } else if (t == 7) pos += 1;
+                        else { uint8_t szs[] = {1,1,2,2,4,4,4,0,0,0,8,8,8}; pos += szs[t<13?t:4]; }
+                    }
+
+                    /* Allocate tensor array */
+                    size_t nbytes = (size_t)ntensors * sizeof(ds4_tensor);
+                    e->markov_model.tensors = xmalloc(nbytes);
+                    e->markov_model.n_tensors = (uint64_t)ntensors;
+
+                    for (uint64_t i = 0; i < ntensors; i++) {
+                        ds4_tensor *t = &e->markov_model.tensors[i];
+                        uint64_t nl; memcpy(&nl, d + pos, 8); pos += 8;
+                        t->name.ptr = (const char *)&d[pos];
+                        t->name.len = (size_t)nl;
+                        pos += nl;
+                        uint32_t nd; memcpy(&nd, d + pos, 4); pos += 4;
+                        t->ndim = nd;
+                        for (uint32_t j = 0; j < nd; j++) {
+                            memcpy(&t->dim[j], d + pos, 8); pos += 8;
+                        }
+                        memcpy(&t->type, d + pos, 4); pos += 4;
+                        uint64_t rel_off; memcpy(&rel_off, d + pos, 8); pos += 8;
+                        t->rel_offset = rel_off;
+                        /* Compute abs_offset and elements */
+                        t->elements = 1;
+                        for (uint32_t j = 0; j < nd; j++) t->elements *= t->dim[j];
+                        t->bytes = t->elements * (t->type == 1 ? 2 : 4);
+                        /* Align descriptor end */
+                        size_t desc_aligned = ((pos + 31) / 32) * 32;
+                        t->abs_offset = (uint64_t)desc_aligned + rel_off;
+                    }
+                    close(mfd);
+
+                    e->markov_w1 = model_find_tensor(&e->markov_model, "markov_head.w1.weight");
+                    e->markov_w2 = model_find_tensor(&e->markov_model, "markov_head.w2.weight");
+                    if (e->markov_w1 && e->markov_w2 &&
+                        e->markov_w1->dim[0] == e->markov_w2->dim[0] &&
+                        e->markov_w1->dim[1] == DS4_N_VOCAB &&
+                        e->markov_w2->dim[1] == DS4_N_VOCAB) {
+                        e->markov_rank = (int)e->markov_w1->dim[0];
+                        size_t w2_sz = (size_t)e->markov_rank * DS4_N_VOCAB;
+                        e->markov_w2_f32 = xmalloc(w2_sz * sizeof(float));
+                        const uint16_t *w2_f16 = (const uint16_t *)tensor_data(&e->markov_model, e->markov_w2);
+                        for (size_t i = 0; i < w2_sz; i++)
+                            e->markov_w2_f32[i] = f16_to_f32(w2_f16[i]);
+                        e->markov_ready = true;
+                        fprintf(stderr, "ds4: Markov head loaded from %s (rank=%d, vocab=%d)\n",
+                                opt->markov_path, e->markov_rank, (int)DS4_N_VOCAB);
+                    }
+                }
+            }
         }
-     }
+      }
 
 #ifndef DS4_NO_GPU
     if (e->backend == DS4_BACKEND_CUDA) {
@@ -27220,21 +27289,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     }
     token_vec_push(&s->checkpoint, token);
     if (markov_should_draft) {
-        int draft = markov_draft(e, token);
-        if (draft >= 0) {
-            s->mtp_draft_token = draft;
+        int drafts[16];
+        int ndraft = markov_draft_chain(e, token, e->mtp_draft_tokens > 0 ? e->mtp_draft_tokens : 5, drafts);
+        if (ndraft > 0) {
+            s->mtp_draft_token = drafts[0];
             s->mtp_draft_valid = true;
+            /* TODO: store chain for multi-token verification */
         }
     } else if (mtp_should_draft) {
         int mtp_top = -1;
-        bool drafted = false;
-        /* Use Markov head for fast single-token drafting when available */
-        if (e->markov_ready) {
-            mtp_top = markov_draft(e, token);
-            drafted = (mtp_top >= 0);
-        }
-        if (!drafted) {
-            drafted = metal_graph_eval_mtp_draft(&s->graph,
+        bool drafted = metal_graph_eval_mtp_draft(&s->graph,
                                        &e->model,
                                        &e->weights,
                                        &e->mtp_model,
@@ -27242,8 +27306,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                        token,
                                        (uint32_t)(s->checkpoint.len - 1),
                                        getenv("DS4_MTP_FULL_LOGITS") ? s->mtp_logits : NULL,
-                                       &mtp_top);
-        }
+                                        &mtp_top);
         if (drafted) {
             s->mtp_draft_token = mtp_top >= 0 ? mtp_top : sample_argmax(s->mtp_logits, DS4_N_VOCAB);
             s->mtp_draft_valid = true;
